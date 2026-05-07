@@ -25,6 +25,9 @@ except ImportError:
     from .planning import engine as planning_engine, _split_csv
 
 import asyncio
+import hashlib
+import re
+from datetime import datetime, timezone
 
 mcp = FastMCP("grok-search")
 
@@ -336,6 +339,69 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
     return None
 
 
+_SESSION_BASENAME_RE = re.compile(r"^grok_\d{8}_\d{6}_[0-9a-f]{6}$")
+_SQ_ID_RE = re.compile(r"^sq\d+$")
+_SESSION_MARKER_FILES = ("status.json", "plan.json")
+
+
+def _validate_and_build_raw_dir(session_dir: str, sq_id: str) -> Path:
+    """Validate session_dir and sq_id, return the raw dir path for this sq.
+
+    Raises ValueError whose first arg is one of the canonical raw_error_type
+    tokens: 'session_invalid' or 'sq_invalid'.
+    """
+    p = Path(session_dir)
+    if not p.is_absolute():
+        raise ValueError("session_invalid")
+    try:
+        p = p.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("session_invalid")
+    if not p.is_dir():
+        raise ValueError("session_invalid")
+    if not _SESSION_BASENAME_RE.match(p.name):
+        raise ValueError("session_invalid")
+    if not any((p / m).exists() for m in _SESSION_MARKER_FILES):
+        raise ValueError("session_invalid")
+    if not _SQ_ID_RE.match(sq_id or ""):
+        raise ValueError("sq_invalid")
+    raw_dir = p / "raw" / sq_id
+    expected_root = (p / "raw").resolve()
+    try:
+        resolved_raw = raw_dir.resolve()
+        resolved_raw.relative_to(expected_root)
+    except (OSError, ValueError):
+        raise ValueError("session_invalid")
+    return raw_dir
+
+
+def _persist_raw(session_dir: str, sq_id: str, url: str, content: str) -> dict:
+    """Write content to a raw markdown file inside the session.
+
+    Returns dict with raw_path (relative to session_dir), raw_sha256, bytes.
+    Raises ValueError(<raw_error_type>) on failure.
+    """
+    raw_dir = _validate_and_build_raw_dir(session_dir, sq_id)
+    try:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        content_bytes = content.encode("utf-8")
+        digest = hashlib.sha256(content_bytes).hexdigest()
+        url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"{timestamp}_{url_hash}_{digest[:12]}.md"
+        raw_file = raw_dir / filename
+        raw_file.write_bytes(content_bytes)
+    except OSError:
+        raise ValueError("persist_failed")
+    session_root = Path(session_dir).resolve()
+    rel_path = raw_file.relative_to(session_root).as_posix()
+    return {
+        "raw_path": rel_path,
+        "raw_sha256": digest,
+        "bytes": len(content_bytes),
+    }
+
+
 @mcp.tool(
     name="web_fetch",
     output_schema=None,
@@ -346,39 +412,75 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
         - **Full Content Extraction:** Retrieves and parses all meaningful content (text, images, links, tables, code blocks).
         - **Markdown Conversion:** Converts HTML structure to well-formatted Markdown with preserved hierarchy.
         - **Content Fidelity:** Maintains 100% content fidelity without summarization or modification.
-        - **Provider Metadata:** On success, the first line is an HTML comment of the form
-          `<!-- grok-search-meta: provider=tavily_extract -->` or `provider=firecrawl_scrape`,
-          identifying the underlying extraction backend. Strip this line before treating the
-          rest as page content.
+        - **Provider Metadata & Raw Persistence:** On success, the first line is an HTML comment
+          of the form `<!-- grok-search-meta: provider=<name> [raw_path=... raw_sha256=... bytes=N] -->`.
+          When `session_dir` (absolute path) AND `sq_id` are both provided, the markdown is
+          persisted to `<session_dir>/raw/<sq_id>/<timestamp>_<urlhash>_<digestprefix>.md` and
+          the meta header includes `raw_path`, `raw_sha256`, and `bytes`. The persisted file is
+          clean markdown without the meta header. If persistence fails, the meta header carries
+          `raw_status=error raw_error_type=<session_invalid|sq_invalid|persist_failed|arg_invalid>`
+          instead of the raw_* fields. Clients must strip the meta line before treating the
+          remainder as page content.
 
     **Edge Cases & Best Practices:**
         - Ensure URL is complete and accessible (not behind authentication or paywalls).
         - May not capture dynamically loaded content requiring JavaScript execution.
         - Large pages may take longer to process; consider timeout implications.
     """,
-    meta={"version": "1.4.0", "author": "guda.studio"},
+    meta={"version": "1.5.0", "author": "guda.studio"},
 )
 async def web_fetch(
     url: Annotated[str, "Valid HTTP/HTTPS web address pointing to the target page. Must be complete and accessible."],
-    ctx: Context = None
+    session_dir: Annotated[Optional[str], "Optional. Absolute path to a grok-research session directory (basename must match grok_YYYYMMDD_HHMMSS_xxxxxx, must contain status.json or plan.json). When provided together with sq_id, the fetched markdown is persisted to <session_dir>/raw/<sq_id>/."] = None,
+    sq_id: Annotated[Optional[str], "Optional. Sub-query id matching ^sq\\d+$ (e.g. 'sq1'). Required when session_dir is provided; ignored otherwise."] = None,
+    ctx: Context = None,
 ) -> str:
     await log_info(ctx, f"Begin Fetch: {url}", config.debug_enabled)
 
+    provider: Optional[str] = None
     result = await _call_tavily_extract(url)
     if result:
+        provider = "tavily_extract"
         await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
-        return f"<!-- grok-search-meta: provider=tavily_extract -->\n{result}"
+    else:
+        await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
+        result = await _call_firecrawl_scrape(url, ctx)
+        if result:
+            provider = "firecrawl_scrape"
+            await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
 
-    await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
-    result = await _call_firecrawl_scrape(url, ctx)
-    if result:
-        await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
-        return f"<!-- grok-search-meta: provider=firecrawl_scrape -->\n{result}"
+    if not provider:
+        await log_info(ctx, "Fetch Failed!", config.debug_enabled)
+        if not config.tavily_api_key and not config.firecrawl_api_key:
+            return "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置"
+        return "提取失败: 所有提取服务均未能获取内容"
 
-    await log_info(ctx, "Fetch Failed!", config.debug_enabled)
-    if not config.tavily_api_key and not config.firecrawl_api_key:
-        return "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置"
-    return "提取失败: 所有提取服务均未能获取内容"
+    meta_parts = [f"provider={provider}"]
+    if session_dir or sq_id:
+        if not (session_dir and sq_id):
+            await log_info(
+                ctx,
+                "Raw persist skipped: session_dir and sq_id must both be provided",
+                config.debug_enabled,
+            )
+            meta_parts.append("raw_status=error")
+            meta_parts.append("raw_error_type=arg_invalid")
+        else:
+            try:
+                raw_info = _persist_raw(session_dir, sq_id, url, result)
+                meta_parts.append(f"raw_path={raw_info['raw_path']}")
+                meta_parts.append(f"raw_sha256={raw_info['raw_sha256']}")
+                meta_parts.append(f"bytes={raw_info['bytes']}")
+            except ValueError as e:
+                error_type = e.args[0] if e.args else "persist_failed"
+                await log_info(
+                    ctx, f"Raw persist failed: {error_type}", config.debug_enabled
+                )
+                meta_parts.append("raw_status=error")
+                meta_parts.append(f"raw_error_type={error_type}")
+
+    header = f"<!-- grok-search-meta: {' '.join(meta_parts)} -->"
+    return f"{header}\n{result}"
 
 
 async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 1,
