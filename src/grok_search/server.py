@@ -346,13 +346,17 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
         - **Full Content Extraction:** Retrieves and parses all meaningful content (text, images, links, tables, code blocks).
         - **Markdown Conversion:** Converts HTML structure to well-formatted Markdown with preserved hierarchy.
         - **Content Fidelity:** Maintains 100% content fidelity without summarization or modification.
+        - **Provider Metadata:** On success, the first line is an HTML comment of the form
+          `<!-- grok-search-meta: provider=tavily_extract -->` or `provider=firecrawl_scrape`,
+          identifying the underlying extraction backend. Strip this line before treating the
+          rest as page content.
 
     **Edge Cases & Best Practices:**
         - Ensure URL is complete and accessible (not behind authentication or paywalls).
         - May not capture dynamically loaded content requiring JavaScript execution.
         - Large pages may take longer to process; consider timeout implications.
     """,
-    meta={"version": "1.3.0", "author": "guda.studio"},
+    meta={"version": "1.4.0", "author": "guda.studio"},
 )
 async def web_fetch(
     url: Annotated[str, "Valid HTTP/HTTPS web address pointing to the target page. Must be complete and accessible."],
@@ -363,13 +367,13 @@ async def web_fetch(
     result = await _call_tavily_extract(url)
     if result:
         await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
-        return result
+        return f"<!-- grok-search-meta: provider=tavily_extract -->\n{result}"
 
     await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
     result = await _call_firecrawl_scrape(url, ctx)
     if result:
         await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
-        return result
+        return f"<!-- grok-search-meta: provider=firecrawl_scrape -->\n{result}"
 
     await log_info(ctx, "Fetch Failed!", config.debug_enabled)
     if not config.tavily_api_key and not config.firecrawl_api_key:
