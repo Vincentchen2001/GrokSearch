@@ -9,7 +9,7 @@ def test_default_grok_limiter_is_not_single_global_lock(monkeypatch):
     monkeypatch.delenv("GROK_MAX_CONCURRENT_REQUESTS", raising=False)
 
     assert grok.config.grok_global_lock_enabled is False
-    assert grok.config.grok_max_concurrent_requests == 4
+    assert grok.config.grok_max_concurrent_requests == 32
 
 
 def test_file_slot_limiter_allows_multiple_concurrent_holders(tmp_path):

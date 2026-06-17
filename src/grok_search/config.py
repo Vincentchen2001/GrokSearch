@@ -74,7 +74,7 @@ class Config:
 
     @property
     def grok_max_concurrent_requests(self) -> int:
-        return int(os.getenv("GROK_MAX_CONCURRENT_REQUESTS", "4"))
+        return int(os.getenv("GROK_MAX_CONCURRENT_REQUESTS", "32"))
 
     @property
     def grok_global_lock_file(self) -> str:
