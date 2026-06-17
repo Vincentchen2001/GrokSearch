@@ -167,11 +167,11 @@ async def web_search(
             tavily_count = extra_sources
 
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
+    async def _safe_grok() -> dict:
         try:
-            return await grok_provider.search(query, platform)
-        except Exception:
-            return ""
+            return {"content": await grok_provider.search(query, platform), "error": None}
+        except Exception as e:
+            return {"content": "", "error": f"{type(e).__name__}: {e}"}
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -195,7 +195,9 @@ async def web_search(
 
     gathered = await asyncio.gather(*coros)
 
-    grok_result: str = gathered[0] or ""
+    grok_out: dict = gathered[0] or {}
+    grok_result: str = grok_out.get("content") or ""
+    grok_error: str | None = grok_out.get("error")
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -206,11 +208,20 @@ async def web_search(
         firecrawl_results = gathered[idx]
 
     answer, grok_sources = split_answer_and_sources(grok_result)
+    provider_sources = getattr(grok_provider, "last_sources", [])
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
-    all_sources = merge_sources(grok_sources, extra)
+    all_sources = merge_sources(provider_sources, grok_sources, extra)
+
+    if grok_error and not answer:
+        answer = f"GROK_SEARCH_FAILED: {grok_error}"
+    elif grok_error:
+        answer = f"{answer}\n\nGROK_SEARCH_WARNING: {grok_error}"
 
     await _SOURCES_CACHE.set(session_id, all_sources)
-    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    out = {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    if grok_error:
+        out["grok_error"] = grok_error
+    return out
 
 
 @mcp.tool(

@@ -65,6 +65,26 @@ class Config:
         return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
 
     @property
+    def stream_enabled(self) -> bool:
+        return os.getenv("GROK_STREAM", "true").lower() in ("true", "1", "yes")
+
+    @property
+    def grok_global_lock_enabled(self) -> bool:
+        return os.getenv("GROK_GLOBAL_LOCK_ENABLED", "false").lower() in ("true", "1", "yes")
+
+    @property
+    def grok_max_concurrent_requests(self) -> int:
+        return int(os.getenv("GROK_MAX_CONCURRENT_REQUESTS", "4"))
+
+    @property
+    def grok_global_lock_file(self) -> str:
+        return os.getenv("GROK_GLOBAL_LOCK_FILE", "/tmp/grok-search-web-search.lock")
+
+    @property
+    def grok_global_lock_timeout(self) -> float:
+        return float(os.getenv("GROK_GLOBAL_LOCK_TIMEOUT", "300"))
+
+    @property
     def guda_base_url(self) -> str:
         return os.getenv("GUDA_BASE_URL", self._DEFAULT_GUDA_BASE_URL)
 

@@ -88,7 +88,44 @@ def split_answer_and_sources(text: str) -> tuple[str, list[dict]]:
     if split:
         return split
 
+    inline_sources = _extract_sources_from_text(raw)
+    if inline_sources:
+        return raw, inline_sources
+
     return raw, []
+
+
+def extract_sources_from_openai_response(data: dict) -> list[dict]:
+    """Extract source metadata from OpenAI-compatible chat responses.
+
+    grok2api may expose web citations outside ``message.content`` via top-level
+    ``search_sources`` and per-message ``annotations``. Preserve those sources
+    so ``web_search`` can populate ``sources_count`` and ``get_sources``.
+    """
+    if not isinstance(data, dict):
+        return []
+
+    source_lists: list[list[dict]] = []
+
+    for key in ("search_sources", "sources", "citations", "references", "urls"):
+        if key in data:
+            source_lists.append(_normalize_sources(data[key]))
+
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+
+        for key in ("search_sources", "sources", "citations", "references", "urls"):
+            if key in message:
+                source_lists.append(_normalize_sources(message[key]))
+
+        annotations = message.get("annotations") or []
+        source_lists.append(_sources_from_annotations(annotations))
+
+    return merge_sources(*source_lists)
 
 
 def _split_function_call_sources(text: str) -> tuple[str, list[dict]] | None:
@@ -307,10 +344,32 @@ def _normalize_sources(data: Any) -> list[dict]:
             desc = item.get("description") or item.get("snippet") or item.get("content")
             if isinstance(desc, str) and desc.strip():
                 out["description"] = desc.strip()
+            for meta_key in ("provider", "type", "source", "published_date"):
+                meta_value = item.get(meta_key)
+                if isinstance(meta_value, str) and meta_value.strip():
+                    out[meta_key] = meta_value.strip()
             normalized.append(out)
             continue
 
     return normalized
+
+
+def _sources_from_annotations(annotations: Any) -> list[dict]:
+    if not isinstance(annotations, list):
+        return []
+
+    items: list[Any] = []
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+        citation = annotation.get("url_citation")
+        if isinstance(citation, dict):
+            items.append(citation)
+            continue
+        if annotation.get("type") == "url_citation":
+            items.append(annotation)
+
+    return _normalize_sources(items)
 
 
 def _extract_sources_from_text(text: str) -> list[dict]:

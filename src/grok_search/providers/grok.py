@@ -1,5 +1,10 @@
+import asyncio
+from contextlib import asynccontextmanager
+import fcntl
 import httpx
 import json
+import os
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Optional
@@ -10,6 +15,7 @@ from .base import BaseSearchProvider, SearchResult
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
+from ..sources import extract_sources_from_openai_response
 
 
 def get_local_time_info() -> str:
@@ -70,8 +76,74 @@ def _needs_time_context(query: str) -> bool:
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
+class _EmptyGrokResponseError(RuntimeError):
+    pass
+
+
+def _slot_paths(path: str, slots: int) -> list[str]:
+    slot_count = max(1, int(slots))
+    if slot_count == 1:
+        return [path]
+    return [f"{path}.{i}" for i in range(slot_count)]
+
+
+def _try_acquire_file_lock(path: str) -> int | None:
+    lock_dir = os.path.dirname(path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+
+
+def _acquire_file_slot(path: str, slots: int, timeout_s: float, poll_s: float = 0.05) -> tuple[int, str]:
+    paths = _slot_paths(path, slots)
+    start = os.getpid() % len(paths)
+    ordered_paths = paths[start:] + paths[:start]
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        for slot_path in ordered_paths:
+            fd = _try_acquire_file_lock(slot_path)
+            if fd is not None:
+                return fd, slot_path
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for Grok request slot: %s (slots=%s)" % (path, len(paths)))
+        time.sleep(min(float(poll_s), max(0.0, deadline - time.monotonic())))
+
+
+def _release_file_slot(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@asynccontextmanager
+async def _global_grok_request_lock(ctx=None):
+    slots = 1 if config.grok_global_lock_enabled else config.grok_max_concurrent_requests
+    if slots <= 0:
+        yield
+        return
+    lock_path = config.grok_global_lock_file
+    timeout_s = config.grok_global_lock_timeout
+    await log_info(ctx, f"Waiting for Grok request slot: {lock_path} (slots={slots})", config.debug_enabled)
+    fd, slot_path = await asyncio.to_thread(_acquire_file_slot, lock_path, slots, timeout_s)
+    try:
+        await log_info(ctx, f"Acquired Grok request slot: {slot_path}", config.debug_enabled)
+        yield
+    finally:
+        await asyncio.to_thread(_release_file_slot, fd)
+        await log_info(ctx, f"Released Grok request slot: {slot_path}", config.debug_enabled)
+
+
 def _is_retryable_exception(exc) -> bool:
     """检查异常是否可重试"""
+    if isinstance(exc, _EmptyGrokResponseError):
+        return True
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -121,6 +193,7 @@ class GrokSearchProvider(BaseSearchProvider):
     def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
         super().__init__(api_url, api_key)
         self.model = model
+        self.last_sources: list[dict] = []
 
     def get_provider_name(self) -> str:
         return "Grok"
@@ -146,12 +219,12 @@ class GrokSearchProvider(BaseSearchProvider):
                 },
                 {"role": "user", "content": time_context + query + platform_prompt},
             ],
-            "stream": True,
+            "stream": config.stream_enabled,
         }
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_with_retry(headers, payload, ctx)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -167,9 +240,9 @@ class GrokSearchProvider(BaseSearchProvider):
                 },
                 {"role": "user", "content": url + "\n获取该网页内容并返回其结构化Markdown格式" },
             ],
-            "stream": True,
+            "stream": config.stream_enabled,
         }
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_with_retry(headers, payload, ctx)
 
     async def _parse_streaming_response(self, response, ctx=None) -> str:
         content = ""
@@ -208,9 +281,19 @@ class GrokSearchProvider(BaseSearchProvider):
             except json.JSONDecodeError:
                 pass
         
+        if not (content or "").strip():
+            raise _EmptyGrokResponseError("empty Grok streaming response")
+
         await log_info(ctx, f"content: {content}", config.debug_enabled)
 
         return content
+
+    async def _execute_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+        self.last_sources = []
+        async with _global_grok_request_lock(ctx):
+            if payload.get("stream", True):
+                return await self._execute_stream_with_retry(headers, payload, ctx)
+            return await self._execute_non_stream_with_retry(headers, payload, ctx)
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
         """执行带重试机制的流式 HTTP 请求"""
@@ -233,6 +316,36 @@ class GrokSearchProvider(BaseSearchProvider):
                         response.raise_for_status()
                         return await self._parse_streaming_response(response, ctx)
 
+    async def _execute_non_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+        """执行带重试机制的非流式 HTTP 请求"""
+        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(
+                        f"{self.api_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    self.last_sources = extract_sources_from_openai_response(data)
+                    choices = data.get("choices", [])
+                    if not choices:
+                        raise _EmptyGrokResponseError("empty Grok non-stream response: no choices")
+                    message = choices[0].get("message", {})
+                    content = message.get("content", "") or ""
+                    if not content.strip():
+                        raise _EmptyGrokResponseError("empty Grok non-stream response: no content")
+                    await log_info(ctx, f"content: {content}", config.debug_enabled)
+                    return content
+
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""
         headers = {
@@ -245,9 +358,9 @@ class GrokSearchProvider(BaseSearchProvider):
                 {"role": "system", "content": url_describe_prompt},
                 {"role": "user", "content": url},
             ],
-            "stream": True,
+            "stream": config.stream_enabled,
         }
-        result = await self._execute_stream_with_retry(headers, payload, ctx)
+        result = await self._execute_with_retry(headers, payload, ctx)
         title, extracts = url, ""
         for line in result.strip().splitlines():
             if line.startswith("Title:"):
@@ -268,9 +381,9 @@ class GrokSearchProvider(BaseSearchProvider):
                 {"role": "system", "content": rank_sources_prompt},
                 {"role": "user", "content": f"Query: {query}\n\n{sources_text}"},
             ],
-            "stream": True,
+            "stream": config.stream_enabled,
         }
-        result = await self._execute_stream_with_retry(headers, payload, ctx)
+        result = await self._execute_with_retry(headers, payload, ctx)
         order: list[int] = []
         seen: set[int] = set()
         for token in result.strip().split():
