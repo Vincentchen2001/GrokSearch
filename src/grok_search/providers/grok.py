@@ -144,11 +144,19 @@ def _is_retryable_exception(exc) -> bool:
     """检查异常是否可重试"""
     if isinstance(exc, _EmptyGrokResponseError):
         return True
-    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.RemoteProtocolError)):
+    # DecodingError: 上游声明的 Content-Encoding 与实际压缩不符（2026-07 观测到
+    # "incorrect header check" 批量出现）。重试时由请求侧降级为不压缩（见
+    # _degrade_to_identity_encoding），因此可重试。
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.DecodingError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_STATUS_CODES
     return False
+
+
+def _degrade_to_identity_encoding(headers: dict) -> None:
+    """DecodingError 后要求上游返回未压缩响应，绕开坏的 Content-Encoding。"""
+    headers["Accept-Encoding"] = "identity"
 
 
 class _WaitWithRetryAfter(wait_base):
@@ -307,14 +315,18 @@ class GrokSearchProvider(BaseSearchProvider):
                 reraise=True,
             ):
                 with attempt:
-                    async with client.stream(
-                        "POST",
-                        f"{self.api_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    ) as response:
-                        response.raise_for_status()
-                        return await self._parse_streaming_response(response, ctx)
+                    try:
+                        async with client.stream(
+                            "POST",
+                            f"{self.api_url}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        ) as response:
+                            response.raise_for_status()
+                            return await self._parse_streaming_response(response, ctx)
+                    except httpx.DecodingError:
+                        _degrade_to_identity_encoding(headers)
+                        raise
 
     async def _execute_non_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
         """执行带重试机制的非流式 HTTP 请求"""
@@ -328,12 +340,16 @@ class GrokSearchProvider(BaseSearchProvider):
                 reraise=True,
             ):
                 with attempt:
-                    response = await client.post(
-                        f"{self.api_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
-                    response.raise_for_status()
+                    try:
+                        response = await client.post(
+                            f"{self.api_url}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        )
+                        response.raise_for_status()
+                    except httpx.DecodingError:
+                        _degrade_to_identity_encoding(headers)
+                        raise
                     data = response.json()
                     self.last_sources = extract_sources_from_openai_response(data)
                     choices = data.get("choices", [])
